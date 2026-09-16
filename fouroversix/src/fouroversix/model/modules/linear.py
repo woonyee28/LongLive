@@ -22,11 +22,15 @@ class FourOverSixLinearFunction(torch.autograd.Function):
         weight: torch.Tensor | QuantizedTensor,
         weight_t: QuantizedTensor | None,
         bias: torch.Tensor = None,
+        precomputed_input_q: QuantizedTensor | None = None,
     ) -> tuple[torch.Tensor,]:
         """
         Perform an FP4 matrix multiplication. The input is provided in high precision
         and quantized to FP4 prior to the matrix multiplication, while the weight is
         provided in low precision.
+
+        `precomputed_input_q` lets a caller skip the activation quantization below when
+        it has already computed the identical `QuantizedTensor` elsewhere.
         """
         needs_wgrad = isinstance(weight, (nn.Parameter, torch.Tensor)) and weight.requires_grad
         needs_input_grad = input.requires_grad
@@ -43,7 +47,11 @@ class FourOverSixLinearFunction(torch.autograd.Function):
         else:
             weight_q = quantize_to_fp4(weight.data if isinstance(weight, nn.Parameter) else weight, fprop_weight_config)
         input_2d = input.reshape(-1, input.shape[-1])
-        input_q = quantize_to_fp4(input_2d, fprop_activation_config)
+        input_q = (
+            precomputed_input_q
+            if precomputed_input_q is not None
+            else quantize_to_fp4(input_2d, fprop_activation_config)
+        )
         if needs_wgrad:
             ctx.save_for_backward(
                 input_q.values, input_q.scale_factors, input_q.amax,
@@ -81,7 +89,7 @@ class FourOverSixLinearFunction(torch.autograd.Function):
     ) -> tuple[torch.Tensor, ...]:
         """Backward pass for the FP4 linear layer."""
         if not ctx.needs_wgrad and not ctx.needs_input_grad_flag:
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
         if ctx.needs_wgrad:
             iq_vals, iq_sf, iq_amax, weight, bias = ctx.saved_tensors
@@ -148,6 +156,7 @@ class FourOverSixLinearFunction(torch.autograd.Function):
             grad_weight,
             None,
             grad_bias,
+            None,
         )
 
 @QuantizedModule.register(nn.Linear)
@@ -341,6 +350,42 @@ class FourOverSixLinear(nn.Linear):
             self.quantized_weight(),
             self.quantized_weight_transposed(),
             self.bias,
+            None,
+        )
+
+    def activation_quantization_key(self) -> tuple[Any, ...]:
+        """A hashable summary of this layer's activation-quantization config."""
+        activation_config = self.config.get_activation_config()
+        return (
+            activation_config.backend,
+            activation_config.dtype,
+            activation_config.scale_rule,
+        )
+
+    def quantize_activation(self, input: torch.Tensor) -> QuantizedTensor:
+        """Quantize `input` exactly as this layer's own `forward` would."""
+        input_2d = input.reshape(-1, input.shape[-1])
+        return quantize_to_fp4(input_2d, self.config.get_activation_config())
+
+    def forward_with_precomputed_activation(
+        self,
+        input: torch.Tensor,
+        input_q: QuantizedTensor,
+    ) -> torch.Tensor:
+        """Like `forward`, but skip this layer's own activation quantization.
+
+        `input_q` must be `self.quantize_activation(input)` (or the equivalent
+        from a sibling layer with the same `activation_quantization_key()`).
+        Does not handle the int32-overflow chunking `forward` does, since this
+        exists specifically for attention's Q/K/V-sized activations.
+        """
+        return FourOverSixLinearFunction.apply(
+            self.config,
+            input,
+            self.quantized_weight(),
+            self.quantized_weight_transposed(),
+            self.bias,
+            input_q,
         )
 
     def _forward_chunked(self, input: torch.Tensor) -> torch.Tensor:
@@ -350,6 +395,6 @@ class FourOverSixLinear(nn.Linear):
         mid = input_2d.shape[0] // 2
         weight = self.quantized_weight()
         weight_t = self.quantized_weight_transposed()
-        out_a = FourOverSixLinearFunction.apply(self.config, input_2d[:mid], weight, weight_t, self.bias)
-        out_b = FourOverSixLinearFunction.apply(self.config, input_2d[mid:], weight, weight_t, self.bias)
+        out_a = FourOverSixLinearFunction.apply(self.config, input_2d[:mid], weight, weight_t, self.bias, None)
+        out_b = FourOverSixLinearFunction.apply(self.config, input_2d[mid:], weight, weight_t, self.bias, None)
         return torch.cat([out_a, out_b], dim=0).reshape(*orig_shape[:-1], -1)

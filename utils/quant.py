@@ -26,7 +26,6 @@ from fouroversix import (
     RoundStyle,
     ScaleRule,
     quantize_model,
-    quantize_to_fp4,
 )
 from fouroversix.quantize.quantized_tensor import from_blocked
 
@@ -71,9 +70,17 @@ FILTER_PROFILE_ALIASES = {
 }
 
 
+from fouroversix import quantize_to_fp4 as _fouroversix_quantize_to_fp4
+
+def quantize_to_fp4(x: torch.Tensor, config: QuantizationConfig) -> QuantizedTensor:
+    if getattr(config, "quantizer", "fouroversix") == "bitdecoding":
+        return bitdecoding_quantize_kv(x)
+    return _fouroversix_quantize_to_fp4(x, config)
+
 @dataclass
 class LongLiveQuantizationConfig(QuantizationConfig):
     type: str = "weight"
+    quantizer: str = "fouroversix"
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -816,3 +823,52 @@ def quantize_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         k[:, :, head, :] = k_head
         v[:, :, head, :] = v_head
     return k, v
+
+def bitdecoding_quantize_kv(x: torch.Tensor) -> QuantizedTensor:
+    from nvfp4_decode_kernel.reference import nvfp4_quantize
+    from fouroversix.quantize.pytorch.reference import (
+        fake_quantize_to_e2m1,
+        quantize_bf16_to_unpacked_fp4,
+        pack_unpacked_fp4,
+        quantize_to_nvfp4,
+    )
+    from fouroversix.quantize.utils import to_blocked
+
+    orig_shape = x.shape
+    rows, cols = orig_shape
+    x_flat = x.reshape(-1, 16).float()
+
+    _, _, winner = nvfp4_quantize(x_flat, group=16, scale_mode="four_six_sixhalf")
+    winner = winner.squeeze(-1)
+
+    x_amax = x.abs().max().float()
+    x_block_scaled_6, x_scales_6 = quantize_to_nvfp4(
+        x_flat, x_amax, scale_rule=ScaleRule.mse, scale_expansion_factor=1.0,
+    )
+    x_block_scaled_4, x_scales_4 = quantize_to_nvfp4(
+        x_flat, x_amax, scale_rule=ScaleRule.mse, scale_expansion_factor=6.0 / 4.0,
+    )
+    x_block_scaled_6h, x_scales_6h = quantize_to_nvfp4(
+        x_flat, x_amax, scale_rule=ScaleRule.mse, scale_expansion_factor=6.0 / 6.5,
+    )
+
+    is_6 = (winner == 0)
+    is_4 = (winner == 1)
+    x_scales = torch.where(is_6, x_scales_6, torch.where(is_4, x_scales_4, x_scales_6h))
+    x_block_scaled = torch.where(
+        is_6.unsqueeze(-1), x_block_scaled_6,
+        torch.where(is_4.unsqueeze(-1), x_block_scaled_4, x_block_scaled_6h),
+    )
+
+    x_fake = fake_quantize_to_e2m1(x_block_scaled).reshape(rows, cols).to(torch.bfloat16)
+    packed = pack_unpacked_fp4(quantize_bf16_to_unpacked_fp4(x_fake))
+    x_scales_blocked = to_blocked(x_scales.reshape(rows, cols // 16))
+
+    return QuantizedTensor(
+        values=packed,
+        scale_factors=x_scales_blocked,
+        amax=x_amax,
+        dtype=DataType.nvfp4,
+        original_shape=orig_shape,
+        scale_rule=ScaleRule.mse,
+    )

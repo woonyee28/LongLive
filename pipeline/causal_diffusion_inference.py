@@ -3,13 +3,34 @@
 
 from tqdm import tqdm
 from typing import List, Optional
+import contextlib
 import os
+import time
 import statistics
 import threading
 import torch
 import math
 
 _LLV2_TIME = os.environ.get("LLV2_TIME") == "1"
+_LLV2_E2E = os.environ.get("LLV2_E2E") == "1"
+LAST_STAGE_TIMES = {}
+
+@contextlib.contextmanager
+def _stage_timer(key):
+    """Time one stage, synchronizing so async CUDA work lands inside it."""
+    if not _LLV2_E2E:
+        yield
+        return
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize()
+        LAST_STAGE_TIMES[key] = LAST_STAGE_TIMES.get(key, 0.0) + (
+            time.perf_counter() - _t0
+        )
+
 _LLV2_DUMP_LATENT_DIR = os.environ.get("LLV2_DUMP_LATENT_DIR", "").strip()
 # LLV2_PROFILE format: "<call_idx>:<wait>:<warmup>:<active>", e.g. "0:20:2:2"
 _LLV2_PROFILE_SPEC = os.environ.get("LLV2_PROFILE", "").strip()
@@ -86,6 +107,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.quantize_kv = getattr(args, "kv_quant", False)
         self.kv_quant_scale_rule = getattr(args, "kv_quant_scale_rule", "mse")
         self.kv_quant_backend = getattr(args, "kv_quant_backend", "cuda")
+        self.kv_quant_quantizer = getattr(args, "kv_quant_quantizer", "fouroversix")
+        self.fp4_attn = getattr(args, "model_kwargs", {}).get("fp4_attn", False)
         self.independent_first_frame = section_get(args, "inference", "independent_first_frame", False)
         self.local_attn_size = section_get(
             args, "inference", "local_attn_size", -1, aliases=("inference_local_attn_size",)
@@ -125,6 +148,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 scale_rule=self.kv_quant_scale_rule,
                 backend=self.kv_quant_backend,
                 type="kv",
+                quantizer=self.kv_quant_quantizer,
             )
         else:
             self.kv_quant_config = None
@@ -173,6 +197,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         start_frame_index: Optional[int] = 0
     ) -> torch.Tensor:
+        LAST_STAGE_TIMES.clear()
         """
         Perform inference on the given noise and text prompts.
         Inputs:
@@ -209,16 +234,17 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         num_output_frames = (
             num_frames if clamp_i2v_first_chunk else num_frames + num_input_frames
         )
-        conditional_dict, conditional_dict_list = encode_prompt_blocks(
-            self.text_encoder, text_prompts, batch_size
-        )
-        use_cfg = self.guidance_scale != 1.0
-        if use_cfg:
-            unconditional_dict = self.text_encoder(
-                text_prompts=[self.negative_prompt] * batch_size
+        with _stage_timer("text_encode_s"):
+            conditional_dict, conditional_dict_list = encode_prompt_blocks(
+                self.text_encoder, text_prompts, batch_size
             )
-        else:
-            unconditional_dict = None
+            use_cfg = self.guidance_scale != 1.0
+            if use_cfg:
+                unconditional_dict = self.text_encoder(
+                    text_prompts=[self.negative_prompt] * batch_size
+                )
+            else:
+                unconditional_dict = None
 
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
@@ -529,6 +555,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     f"-> {_prof_trace_path}",
                     flush=True,
                 )
+        _dit_t0 = time.perf_counter()
+        if _LLV2_E2E:
+            torch.cuda.synchronize()
+            _dit_t0 = time.perf_counter()
         for chunk_index, current_num_frames in enumerate(all_num_frames):
             if _LLV2_TIME:
                 _ev_s = torch.cuda.Event(enable_timing=True)
@@ -709,6 +739,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             _prof.export_chrome_trace(_prof_trace_path)
             print(f"[LLV2_PROFILE] saved trace -> {_prof_trace_path}", flush=True)
 
+        if _LLV2_E2E:
+            torch.cuda.synchronize()
+            LAST_STAGE_TIMES["dit_s"] = time.perf_counter() - _dit_t0
+
         if _LLV2_TIME and _block_events:
             torch.cuda.synchronize()
             _times = [_s.elapsed_time(_e) for _s, _e in _block_events]
@@ -760,8 +794,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             self.vae.model.clear_cache()
             return video
         else:
-            video = self.vae.decode_to_pixel(output)
-            video = (video * 0.5 + 0.5).clamp(0, 1)
+            with _stage_timer("vae_decode_s"):
+                video = self.vae.decode_to_pixel(output)
+                video = (video * 0.5 + 0.5).clamp(0, 1)
             return video
 
     def _initialize_kv_cache(self, batch_size, dtype, device):
@@ -782,13 +817,36 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         block_token_size = self.num_frame_per_block * self.frame_seq_length
         max_blocks = kv_cache_size // block_token_size
 
+        if self.fp4_attn:
+            from utils.fp4_attention import init_fp4_kv_cache, PAGE_SIZE
+
+            assert block_token_size % PAGE_SIZE == 0, (
+                f"fp4_attn requires block_token_size ({block_token_size}) to be a "
+                f"multiple of BitDecoding-FP4's fixed PAGE_SIZE ({PAGE_SIZE})"
+            )
+            pages_per_block = block_token_size // PAGE_SIZE
+            for _ in range(self.num_transformer_blocks):
+                for cache_list in (kv_cache_pos, kv_cache_neg):
+                    cache_list.append({
+                        "fp4_cache": init_fp4_kv_cache(max_blocks, pages_per_block, num_heads, device),
+                        "quantized": False,
+                        "fp4_attn": True,
+                        "block_token_size": block_token_size,
+                        "max_blocks": max_blocks,
+                        "num_heads": num_heads,
+                        "num_filled_blocks": 0,
+                        "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                        "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                        "pinned_start": torch.tensor([-1], dtype=torch.long, device=device),
+                        "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
+                    })
+            self.kv_cache_pos = kv_cache_pos
+            self.kv_cache_neg = kv_cache_neg
+            return
+
         if self.quantize_kv:
             from utils.quant import clone_quantized_tensor, quantize_to_fp4
 
-            print(
-                f"[KV Cache] Quantized (nvfp4): block_token_size={block_token_size}, "
-                f"max_blocks={max_blocks}, num_heads={num_heads}, layers={self.num_transformer_blocks}"
-            )
             zero_block = torch.zeros(
                 [block_token_size * num_heads, head_dim],
                 dtype=dtype,
@@ -852,8 +910,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     "pinned_len": torch.tensor([0], dtype=torch.long, device=device),
                 })
 
-        self.kv_cache_pos = kv_cache_pos  # always store the clean cache
-        self.kv_cache_neg = kv_cache_neg  # always store the clean cache
+        self.kv_cache_pos = kv_cache_pos  
+        self.kv_cache_neg = kv_cache_neg  
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """

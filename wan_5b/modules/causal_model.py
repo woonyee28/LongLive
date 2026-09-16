@@ -231,6 +231,7 @@ class MultiShotT2VCrossAttention(WanCrossAttention):
             # block `mode=reduce-overhead`. Per-call recompute cost is tiny
             # (~1.7us / call in NVFP4 × ~11.5k calls/prompt ≈ 19 ms total),
             # for cudagraphs unlock of the 28% wall-time gap.
+
             k = self.norm_k(self.k(context)).view(b_eff, -1, n, d)
             v = self.v(context).view(b_eff, -1, n, d)
 
@@ -303,7 +304,8 @@ class CausalWanSelfAttention(nn.Module):
                  local_attn_size=-1,
                  sink_size=0,
                  qk_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 fp4_attn=False):
         assert dim % num_heads == 0
         super().__init__()
         self.dim = dim
@@ -314,6 +316,7 @@ class CausalWanSelfAttention(nn.Module):
         self.global_sink_size = 0
         self.qk_norm = qk_norm
         self.eps = eps
+        self.fp4_attn = fp4_attn
         self.max_attention_size = 24 * 880 if local_attn_size == -1 else local_attn_size * 880
 
         # layers
@@ -491,7 +494,8 @@ class CausalWanSelfAttention(nn.Module):
             sink_tokens = self.sink_size * frame_seqlen
             global_sink_tokens = getattr(self, "global_sink_size", 0) * frame_seqlen
             is_quantized_cache = kv_cache.get("quantized", False)
-            if is_quantized_cache:
+            is_fp4_cache = kv_cache.get("fp4_attn", False)
+            if is_quantized_cache or is_fp4_cache:
                 kv_cache_size = kv_cache["max_blocks"] * kv_cache["block_token_size"]
             else:
                 kv_cache_size = kv_cache["k"].shape[1]
@@ -554,85 +558,36 @@ class CausalWanSelfAttention(nn.Module):
                     _cache_global_end - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
 
-                if is_quantized_cache:
-                    from utils.quant import dequantize_kv_cache, k_smooth
+                if is_fp4_cache:
+                    from utils.quant import k_smooth
+                    from utils.fp4_attention import roll_blocks, insert_block
 
-                    max_blks = int(kv_cache["max_blocks"])
+                    assert not has_pinned, "fp4_attn does not support multi-shot pinned regions yet"
                     blk_sz = int(kv_cache["block_token_size"])
-                    cache_k = dequantize_kv_cache(
-                        kv_cache["k"], max_blks, self.num_heads, blk_sz, v.dtype, v.device
+                    assert effective_sink % blk_sz == 0 and num_evicted_tokens % blk_sz == 0 and num_rolled_tokens % blk_sz == 0, (
+                        "fp4_attn requires whole-block rolling (sink/evict/roll all block-aligned)"
                     )
-                    cache_v = dequantize_kv_cache(
-                        kv_cache["v"], max_blks, self.num_heads, blk_sz, v.dtype, v.device
+                    sink_blks = effective_sink // blk_sz
+                    evict_blks = num_evicted_tokens // blk_sz
+                    roll_blks = num_rolled_tokens // blk_sz
+                    roll_blocks(kv_cache["fp4_cache"], sink_blks, evict_blks, roll_blks)
+                    from utils import fp4_attention_debug as _fp4dbg
+                    _fp4dbg.on_roll(kv_cache, effective_sink, num_evicted_tokens, num_rolled_tokens)
+                    start_blk = local_start_index // blk_sz
+                    n_insert_blks = (local_end_index - local_start_index) // blk_sz
+                    _k_sm = k_smooth(key_to_cache).squeeze(0)
+                    insert_block(
+                        kv_cache["fp4_cache"], start_blk, n_insert_blks,
+                        _k_sm, v.squeeze(0),
                     )
-                    new_k_for_cache = k_smooth(key_to_cache)
+                    _fp4dbg.on_insert(kv_cache, local_start_index, local_end_index, _k_sm, v.squeeze(0))
+                    cache_update_info = None
+                    kv_cache["global_end_index"].fill_(current_end)
+                    kv_cache["local_end_index"].fill_(local_end_index)
                 else:
-                    cache_k = kv_cache["k"]
-                    cache_v = kv_cache["v"]
-                    new_k_for_cache = key_to_cache
+                    if is_quantized_cache:
+                        from utils.quant import dequantize_kv_cache, k_smooth
 
-                if _CGRAPH_OUTPLACE_KV_ENABLED:
-                    # Cudagraph experiment: build the post-roll cache view
-                    # out-of-place. Slice assignment here forces Inductor
-                    # cudagraph partitions to mutate inputs.
-                    temp_k = torch.cat([
-                        cache_k[:, :effective_sink],
-                        cache_k[:, effective_sink + num_evicted_tokens:
-                                effective_sink + num_evicted_tokens + num_rolled_tokens],
-                        new_k_for_cache,
-                    ], dim=1)
-                    temp_v = torch.cat([
-                        cache_v[:, :effective_sink],
-                        cache_v[:, effective_sink + num_evicted_tokens:
-                                effective_sink + num_evicted_tokens + num_rolled_tokens],
-                        v,
-                    ], dim=1)
-                else:
-                    temp_k = cache_k if is_quantized_cache else cache_k.clone()
-                    temp_v = cache_v if is_quantized_cache else cache_v.clone()
-
-                    temp_k[:, effective_sink:effective_sink + num_rolled_tokens] = \
-                        temp_k[:, effective_sink + num_evicted_tokens:effective_sink + num_evicted_tokens + num_rolled_tokens].clone()
-                    temp_v[:, effective_sink:effective_sink + num_rolled_tokens] = \
-                        temp_v[:, effective_sink + num_evicted_tokens:effective_sink + num_evicted_tokens + num_rolled_tokens].clone()
-
-                    temp_k[:, local_start_index:local_end_index] = new_k_for_cache
-                    temp_v[:, local_start_index:local_end_index] = v
-
-                # When pinned is "floating" (lives outside effective_sink), the
-                # rolling shifted non-pinned data left by num_evicted_tokens;
-                # the pinned anchor must follow that shift to keep tracking the
-                # same data. When pinned sits inside effective_sink (i.e. right
-                # after the global region), it is part of the protected prefix
-                # and rolling does not move it.
-                pinned_shift = num_evicted_tokens if (has_pinned and pinned_start_val >= effective_sink) else 0
-
-                cache_update_info = {
-                    "action": "roll_and_insert",
-                    "sink_tokens": effective_sink,
-                    "num_rolled_tokens": num_rolled_tokens,
-                    "num_evicted_tokens": num_evicted_tokens,
-                    "local_start_index": local_start_index,
-                    "local_end_index": local_end_index,
-                    "new_k": key_to_cache,
-                    "new_v": v,
-                    "current_end": current_end,
-                    "pinned_shift": pinned_shift,
-                }
-
-            else:
-                # iter-39: reuse the dict-cached scalars from above.
-                local_end_index = _cache_local_end + current_end - _cache_global_end
-                local_start_index = local_end_index - num_new_tokens
-
-                if is_quantized_cache:
-                    from utils.quant import dequantize_kv_cache, k_smooth
-
-                    new_k_for_cache = k_smooth(key_to_cache)
-                    if local_start_index == 0:
-                        temp_k = new_k_for_cache
-                        temp_v = v
-                    else:
                         max_blks = int(kv_cache["max_blocks"])
                         blk_sz = int(kv_cache["block_token_size"])
                         cache_k = dequantize_kv_cache(
@@ -641,144 +596,251 @@ class CausalWanSelfAttention(nn.Module):
                         cache_v = dequantize_kv_cache(
                             kv_cache["v"], max_blks, self.num_heads, blk_sz, v.dtype, v.device
                         )
-                        if _CGRAPH_OUTPLACE_KV_ENABLED:
-                            temp_k = torch.cat([cache_k[:, :local_start_index], new_k_for_cache], dim=1)
-                            temp_v = torch.cat([cache_v[:, :local_start_index], v], dim=1)
-                        else:
-                            temp_k = cache_k
-                            temp_v = cache_v
-                    if not _CGRAPH_OUTPLACE_KV_ENABLED:
+                        new_k_for_cache = k_smooth(key_to_cache)
+                    else:
+                        cache_k = kv_cache["k"]
+                        cache_v = kv_cache["v"]
+                        new_k_for_cache = key_to_cache
+
+                    if _CGRAPH_OUTPLACE_KV_ENABLED:
+                        # Cudagraph experiment: build the post-roll cache view
+                        # out-of-place. Slice assignment here forces Inductor
+                        # cudagraph partitions to mutate inputs.
+                        temp_k = torch.cat([
+                            cache_k[:, :effective_sink],
+                            cache_k[:, effective_sink + num_evicted_tokens:
+                                    effective_sink + num_evicted_tokens + num_rolled_tokens],
+                            new_k_for_cache,
+                        ], dim=1)
+                        temp_v = torch.cat([
+                            cache_v[:, :effective_sink],
+                            cache_v[:, effective_sink + num_evicted_tokens:
+                                    effective_sink + num_evicted_tokens + num_rolled_tokens],
+                            v,
+                        ], dim=1)
+                    else:
+                        temp_k = cache_k if is_quantized_cache else cache_k.clone()
+                        temp_v = cache_v if is_quantized_cache else cache_v.clone()
+
+                        temp_k[:, effective_sink:effective_sink + num_rolled_tokens] = \
+                            temp_k[:, effective_sink + num_evicted_tokens:effective_sink + num_evicted_tokens + num_rolled_tokens].clone()
+                        temp_v[:, effective_sink:effective_sink + num_rolled_tokens] = \
+                            temp_v[:, effective_sink + num_evicted_tokens:effective_sink + num_evicted_tokens + num_rolled_tokens].clone()
+
                         temp_k[:, local_start_index:local_end_index] = new_k_for_cache
                         temp_v[:, local_start_index:local_end_index] = v
-                else:
-                    if _CGRAPH_OUTPLACE_KV_ENABLED:
-                        temp_k = torch.cat([kv_cache["k"][:, :local_start_index], key_to_cache], dim=1)
-                        temp_v = torch.cat([kv_cache["v"][:, :local_start_index], v], dim=1)
-                    else:
-                        temp_k = kv_cache["k"].clone()
-                        temp_v = kv_cache["v"].clone()
-                        temp_k[:, local_start_index:local_end_index] = key_to_cache
-                        temp_v[:, local_start_index:local_end_index] = v
 
-                cache_update_info = {
-                    "action": "direct_insert",
-                    "local_start_index": local_start_index,
-                    "local_end_index": local_end_index,
-                    "new_k": key_to_cache,
-                    "new_v": v,
-                    "current_end": current_end,
-                    "pinned_shift": 0,
-                }
+                    pinned_shift = num_evicted_tokens if (has_pinned and pinned_start_val >= effective_sink) else 0
+
+                    cache_update_info = {
+                        "action": "roll_and_insert",
+                        "sink_tokens": effective_sink,
+                        "num_rolled_tokens": num_rolled_tokens,
+                        "num_evicted_tokens": num_evicted_tokens,
+                        "local_start_index": local_start_index,
+                        "local_end_index": local_end_index,
+                        "new_k": key_to_cache,
+                        "new_v": v,
+                        "current_end": current_end,
+                        "pinned_shift": pinned_shift,
+                    }
+
+            else:
+                # iter-39: reuse the dict-cached scalars from above.
+                local_end_index = _cache_local_end + current_end - _cache_global_end
+                local_start_index = local_end_index - num_new_tokens
+
+                if is_fp4_cache:
+                    from utils.quant import k_smooth
+                    from utils.fp4_attention import insert_block
+
+                    blk_sz = int(kv_cache["block_token_size"])
+                    assert local_start_index % blk_sz == 0 and (local_end_index - local_start_index) % blk_sz == 0, (
+                        "fp4_attn requires whole-block insertion"
+                    )
+                    start_blk = local_start_index // blk_sz
+                    n_insert_blks = (local_end_index - local_start_index) // blk_sz
+                    _k_sm = k_smooth(key_to_cache).squeeze(0)
+                    insert_block(
+                        kv_cache["fp4_cache"], start_blk, n_insert_blks,
+                        _k_sm, v.squeeze(0),
+                    )
+                    from utils import fp4_attention_debug as _fp4dbg
+                    _fp4dbg.on_insert(kv_cache, local_start_index, local_end_index, _k_sm, v.squeeze(0))
+                    cache_update_info = None
+                    kv_cache["global_end_index"].fill_(current_end)
+                    kv_cache["local_end_index"].fill_(local_end_index)
+                else:
+                    if is_quantized_cache:
+                        from utils.quant import dequantize_kv_cache, k_smooth
+
+                        new_k_for_cache = k_smooth(key_to_cache)
+                        if local_start_index == 0:
+                            temp_k = new_k_for_cache
+                            temp_v = v
+                        else:
+                            max_blks = int(kv_cache["max_blocks"])
+                            blk_sz = int(kv_cache["block_token_size"])
+                            cache_k = dequantize_kv_cache(
+                                kv_cache["k"], max_blks, self.num_heads, blk_sz, v.dtype, v.device
+                            )
+                            cache_v = dequantize_kv_cache(
+                                kv_cache["v"], max_blks, self.num_heads, blk_sz, v.dtype, v.device
+                            )
+                            if _CGRAPH_OUTPLACE_KV_ENABLED:
+                                temp_k = torch.cat([cache_k[:, :local_start_index], new_k_for_cache], dim=1)
+                                temp_v = torch.cat([cache_v[:, :local_start_index], v], dim=1)
+                            else:
+                                temp_k = cache_k
+                                temp_v = cache_v
+                        if not _CGRAPH_OUTPLACE_KV_ENABLED:
+                            temp_k[:, local_start_index:local_end_index] = new_k_for_cache
+                            temp_v[:, local_start_index:local_end_index] = v
+                    else:
+                        if _CGRAPH_OUTPLACE_KV_ENABLED:
+                            temp_k = torch.cat([kv_cache["k"][:, :local_start_index], key_to_cache], dim=1)
+                            temp_v = torch.cat([kv_cache["v"][:, :local_start_index], v], dim=1)
+                        else:
+                            temp_k = kv_cache["k"].clone()
+                            temp_v = kv_cache["v"].clone()
+                            temp_k[:, local_start_index:local_end_index] = key_to_cache
+                            temp_v[:, local_start_index:local_end_index] = v
+
+                    cache_update_info = {
+                        "action": "direct_insert",
+                        "local_start_index": local_start_index,
+                        "local_end_index": local_end_index,
+                        "new_k": key_to_cache,
+                        "new_v": v,
+                        "current_end": current_end,
+                        "pinned_shift": 0,
+                    }
 
             window_start = max(0, local_end_index - self.max_attention_size)
 
-            # Build the K/V actually attended over.
-            # Cases:
-            #   (a) prepend_sink  : effective_sink > 0 and out of window
-            #                       -> prepend [:effective_sink] (covers global
-            #                          and any pinned-merged-to-front)
-            #   (b) prepend_pinned: a floating pinned region (pinned_start
-            #                       >= effective_sink) lives outside the window
-            #                       -> additionally prepend that pinned slice
-            #   (c) otherwise     : plain sliding window
-            # Note (a) and (b) are not mutually exclusive: when global is
-            # enabled AND there is a separate floating pinned region outside
-            # the window, both prefixes must be prepended.
-            prepend_sink = effective_sink > 0 and window_start > 0
-            prepend_pinned = (
-                has_pinned and pinned_start_val >= effective_sink
-                and pinned_start_val < window_start
-            )
+            if is_fp4_cache:
+                assert window_start == 0, (
+                    "fp4_attn requires kv_cache_size == max_attention_size "
+                    "(window_start must always be 0); got a real sliding "
+                    "window beyond the ring buffer's own capacity"
+                )
+                assert not use_relative_rope, "fp4_attn does not support use_relative_rope (K is quantized once, at insertion)"
+                from utils.fp4_attention import attend
 
-            if prepend_sink and prepend_pinned:
-                # [global+sink] + [pinned] + [local window]
-                extra = effective_sink + pinned_len_val
-                effective_local_size = self.max_attention_size - extra
-                local_window_start = max(effective_sink, local_end_index - effective_local_size)
-                window_k = torch.cat([
-                    temp_k[:, :effective_sink],
-                    temp_k[:, pinned_start_val:pinned_start_val + pinned_len_val],
-                    temp_k[:, local_window_start:local_end_index],
-                ], dim=1)
-                window_v = torch.cat([
-                    temp_v[:, :effective_sink],
-                    temp_v[:, pinned_start_val:pinned_start_val + pinned_len_val],
-                    temp_v[:, local_window_start:local_end_index],
-                ], dim=1)
-            elif prepend_sink:
-                effective_local_size = self.max_attention_size - effective_sink
-                local_window_start = max(effective_sink, local_end_index - effective_local_size)
-                window_k = torch.cat([temp_k[:, :effective_sink], temp_k[:, local_window_start:local_end_index]], dim=1)
-                window_v = torch.cat([temp_v[:, :effective_sink], temp_v[:, local_window_start:local_end_index]], dim=1)
-            elif prepend_pinned:
-                effective_local_size = self.max_attention_size - pinned_len_val
-                local_window_start = max(0, local_end_index - effective_local_size)
-                window_k = torch.cat(
-                    [temp_k[:, pinned_start_val:pinned_start_val + pinned_len_val],
-                     temp_k[:, local_window_start:local_end_index]], dim=1)
-                window_v = torch.cat(
-                    [temp_v[:, pinned_start_val:pinned_start_val + pinned_len_val],
-                     temp_v[:, local_window_start:local_end_index]], dim=1)
+                seqused_fp4 = kv_cache["local_end_index"].to(torch.int32)
+                from utils import fp4_attention_debug as _fp4dbg
+                x = _fp4dbg.attend_or_ref(
+                    kv_cache, roped_query, seqused_fp4, self.head_dim ** -0.5, self.num_heads, attend,
+                    past_tokens=local_start_index, total_tokens=local_end_index,
+                )
             else:
-                window_k = temp_k[:, window_start:local_end_index]
-                window_v = temp_v[:, window_start:local_end_index]
+                # Build the K/V actually attended over.
+                # Cases:
+                #   (a) prepend_sink  : effective_sink > 0 and out of window
+                #                       -> prepend [:effective_sink] (covers global
+                #                          and any pinned-merged-to-front)
+                #   (b) prepend_pinned: a floating pinned region (pinned_start
+                #                       >= effective_sink) lives outside the window
+                #                       -> additionally prepend that pinned slice
+                #   (c) otherwise     : plain sliding window
+                # Note (a) and (b) are not mutually exclusive: when global is
+                # enabled AND there is a separate floating pinned region outside
+                # the window, both prefixes must be prepended.
+                prepend_sink = effective_sink > 0 and window_start > 0
+                prepend_pinned = (
+                    has_pinned and pinned_start_val >= effective_sink
+                    and pinned_start_val < window_start
+                )
 
-            if use_relative_rope:
-                if prepend_sink:
-                    # Sink and local window tokens get separate RoPE in a
-                    # virtual contiguous layout: [sink_frames | local_frames].
-                    sink_frame_count = effective_sink // frame_seqlen
-                    local_tokens = window_k.shape[1] - effective_sink
-                    local_frame_count = local_tokens // frame_seqlen
-                    combined_frames = sink_frame_count + local_frame_count
-
-                    # iter-30: pass Python list instead of expanded tensor;
-                    # causal_rope_apply skips .tolist() graph break this way.
-                    sink_grid = [(sink_frame_count, h, w)] * b
-                    roped_sink_k = causal_rope_apply(
-                        window_k[:, :effective_sink], sink_grid, freqs,
-                        start_frame=0, t_scale=t_scale,
-                        method=method, original_seq_len=original_seq_len,
-                    ).type_as(v)
-
-                    local_grid = [(local_frame_count, h, w)] * b
-                    roped_local_k = causal_rope_apply(
-                        window_k[:, effective_sink:], local_grid, freqs,
-                        start_frame=sink_frame_count, t_scale=t_scale,
-                        method=method, original_seq_len=original_seq_len,
-                    ).type_as(v)
-
-                    roped_window_k = torch.cat([roped_sink_k, roped_local_k], dim=1)
-
-                    q_start_frame = combined_frames - num_new_frames
-                    roped_query = causal_rope_apply(
-                        q, grid_py, freqs,
-                        start_frame=q_start_frame, t_scale=t_scale,
-                        method=method, original_seq_len=original_seq_len,
-                    ).type_as(v)
+                if prepend_sink and prepend_pinned:
+                    # [global+sink] + [pinned] + [local window]
+                    extra = effective_sink + pinned_len_val
+                    effective_local_size = self.max_attention_size - extra
+                    local_window_start = max(effective_sink, local_end_index - effective_local_size)
+                    window_k = torch.cat([
+                        temp_k[:, :effective_sink],
+                        temp_k[:, pinned_start_val:pinned_start_val + pinned_len_val],
+                        temp_k[:, local_window_start:local_end_index],
+                    ], dim=1)
+                    window_v = torch.cat([
+                        temp_v[:, :effective_sink],
+                        temp_v[:, pinned_start_val:pinned_start_val + pinned_len_val],
+                        temp_v[:, local_window_start:local_end_index],
+                    ], dim=1)
+                elif prepend_sink:
+                    effective_local_size = self.max_attention_size - effective_sink
+                    local_window_start = max(effective_sink, local_end_index - effective_local_size)
+                    window_k = torch.cat([temp_k[:, :effective_sink], temp_k[:, local_window_start:local_end_index]], dim=1)
+                    window_v = torch.cat([temp_v[:, :effective_sink], temp_v[:, local_window_start:local_end_index]], dim=1)
+                elif prepend_pinned:
+                    effective_local_size = self.max_attention_size - pinned_len_val
+                    local_window_start = max(0, local_end_index - effective_local_size)
+                    window_k = torch.cat(
+                        [temp_k[:, pinned_start_val:pinned_start_val + pinned_len_val],
+                         temp_k[:, local_window_start:local_end_index]], dim=1)
+                    window_v = torch.cat(
+                        [temp_v[:, pinned_start_val:pinned_start_val + pinned_len_val],
+                         temp_v[:, local_window_start:local_end_index]], dim=1)
                 else:
-                    window_tokens = window_k.shape[1]
-                    window_frames = window_tokens // frame_seqlen
+                    window_k = temp_k[:, window_start:local_end_index]
+                    window_v = temp_v[:, window_start:local_end_index]
 
-                    # iter-30: Python list to skip .tolist() break.
-                    window_grid_sizes = [(window_frames, h, w)] * b
+                if use_relative_rope:
+                    if prepend_sink:
+                        # Sink and local window tokens get separate RoPE in a
+                        # virtual contiguous layout: [sink_frames | local_frames].
+                        sink_frame_count = effective_sink // frame_seqlen
+                        local_tokens = window_k.shape[1] - effective_sink
+                        local_frame_count = local_tokens // frame_seqlen
+                        combined_frames = sink_frame_count + local_frame_count
 
-                    roped_window_k = causal_rope_apply(
-                        window_k, window_grid_sizes, freqs,
-                        start_frame=0, t_scale=t_scale,
-                        method=method, original_seq_len=original_seq_len,
-                    ).type_as(v)
+                        # iter-30: pass Python list instead of expanded tensor;
+                        # causal_rope_apply skips .tolist() graph break this way.
+                        sink_grid = [(sink_frame_count, h, w)] * b
+                        roped_sink_k = causal_rope_apply(
+                            window_k[:, :effective_sink], sink_grid, freqs,
+                            start_frame=0, t_scale=t_scale,
+                            method=method, original_seq_len=original_seq_len,
+                        ).type_as(v)
 
-                    q_start_frame = window_frames - num_new_frames
-                    roped_query = causal_rope_apply(
-                        q, grid_py, freqs,
-                        start_frame=q_start_frame, t_scale=t_scale,
-                        method=method, original_seq_len=original_seq_len,
-                    ).type_as(v)
+                        local_grid = [(local_frame_count, h, w)] * b
+                        roped_local_k = causal_rope_apply(
+                            window_k[:, effective_sink:], local_grid, freqs,
+                            start_frame=sink_frame_count, t_scale=t_scale,
+                            method=method, original_seq_len=original_seq_len,
+                        ).type_as(v)
 
-                x = attention(roped_query, roped_window_k, window_v)
-            else:
-                x = attention(roped_query, window_k, window_v)
+                        roped_window_k = torch.cat([roped_sink_k, roped_local_k], dim=1)
+
+                        q_start_frame = combined_frames - num_new_frames
+                        roped_query = causal_rope_apply(
+                            q, grid_py, freqs,
+                            start_frame=q_start_frame, t_scale=t_scale,
+                            method=method, original_seq_len=original_seq_len,
+                        ).type_as(v)
+                    else:
+                        window_tokens = window_k.shape[1]
+                        window_frames = window_tokens // frame_seqlen
+
+                        # iter-30: Python list to skip .tolist() break.
+                        window_grid_sizes = [(window_frames, h, w)] * b
+
+                        roped_window_k = causal_rope_apply(
+                            window_k, window_grid_sizes, freqs,
+                            start_frame=0, t_scale=t_scale,
+                            method=method, original_seq_len=original_seq_len,
+                        ).type_as(v)
+
+                        q_start_frame = window_frames - num_new_frames
+                        roped_query = causal_rope_apply(
+                            q, grid_py, freqs,
+                            start_frame=q_start_frame, t_scale=t_scale,
+                            method=method, original_seq_len=original_seq_len,
+                        ).type_as(v)
+
+                    x = attention(roped_query, roped_window_k, window_v)
+                else:
+                    x = attention(roped_query, window_k, window_v)
 
         # output
         x = x.flatten(2)
@@ -801,7 +863,8 @@ class CausalWanAttentionBlock(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 fp4_attn=False):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -813,7 +876,7 @@ class CausalWanAttentionBlock(nn.Module):
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps)
+        self.self_attn = CausalWanSelfAttention(dim, num_heads, local_attn_size, sink_size, qk_norm, eps, fp4_attn=fp4_attn)
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
@@ -988,7 +1051,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  num_frame_per_block=1,
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 fp4_attn=False):
         r"""
         Initialize the diffusion model backbone.
 
@@ -1047,6 +1111,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.fp4_attn = fp4_attn
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -1063,7 +1128,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # blocks
         self.blocks = nn.ModuleList([
             CausalWanAttentionBlock(dim, ffn_dim, num_heads,
-                                  local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
+                                  local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
+                                  fp4_attn=fp4_attn)
             for _ in range(num_layers)
         ])
 

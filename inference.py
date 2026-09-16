@@ -1,6 +1,7 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
 import os
+_LLV2_START = __import__('time').perf_counter()
 import sys
 from pathlib import Path
 
@@ -34,6 +35,10 @@ if not hasattr(_tv_io, "read_video"):
     _tv_io.read_video = _shim_read_video
 
 import argparse
+import json
+import time
+from contextlib import contextmanager
+
 import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -446,8 +451,10 @@ elif merge_lora and local_rank == 0:
 del generator_checkpoint
 
 
-# Move pipeline to appropriate dtype and device
-if loaded_prequantized_generator:
+already_quantized = (
+    getattr(config, "model_quant", False) and not merge_lora and not loaded_prequantized_generator
+)
+if loaded_prequantized_generator or already_quantized:
     pipeline.text_encoder.to(dtype=torch.bfloat16)
     pipeline.vae.to(dtype=torch.bfloat16)
 else:
@@ -586,6 +593,31 @@ def encode(self, videos: torch.Tensor) -> torch.Tensor:
     return output
 
 
+# --- end-to-end generation timing (LLV2_E2E=1) -----------------------------
+# LLV2_TIME covers only the DiT chunk loop inside the denoiser. This covers
+# what someone actually waits for: one-time setup, then per video the
+# denoise, the VAE decode / host transfer, and the mp4 (or latent) write.
+# Both can be on at once; they measure different things and do not interact.
+_LLV2_E2E = os.environ.get("LLV2_E2E") == "1"
+_e2e_videos = []
+_e2e_setup_s = time.perf_counter() - _LLV2_START if _LLV2_E2E else None
+
+
+@contextmanager
+def _e2e_stage(record, key):
+    """Time one stage, synchronizing so async CUDA work lands inside it."""
+    if not _LLV2_E2E:
+        yield
+        return
+    torch.cuda.synchronize()
+    _t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize()
+        record[key] = time.perf_counter() - _t0
+
+
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     idx = batch_data['idx'].item()
 
@@ -639,20 +671,27 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     )
     if initial_latent is not None:
         inference_kwargs["initial_latent"] = initial_latent
-    with torch.inference_mode():
-        generated = pipeline.inference(**inference_kwargs)
+    _stage = {}
+    with _e2e_stage(_stage, "generate_s"):
+        with torch.inference_mode():
+            generated = pipeline.inference(**inference_kwargs)
+    if _LLV2_E2E:
+        # generate_s is the wall time of the whole call; the pipeline breaks it into text encode / DiT / VAE decode. 
+        # They will probably not sum exactly to generate_s bcuz setup and bookkeeping between the stages 
+        # is real time the caller waits for, and is deliberately left unattributed.
+        from pipeline.causal_diffusion_inference import LAST_STAGE_TIMES
+        _stage.update(LAST_STAGE_TIMES)
 
-    if not save_latents_only:
-        current_video = rearrange(generated, 'b t c h w -> b t h w c').cpu()
-        all_video.append(current_video)
-
-        # Final output video
-        video = 255.0 * torch.cat(all_video, dim=1)
-
-        # Clear VAE cache
-        pipeline.vae.model.clear_cache()
-    else:
-        latents = generated
+    with _e2e_stage(_stage, "postproc_s"):
+        if not save_latents_only:
+            current_video = rearrange(generated, 'b t c h w -> b t h w c').cpu()
+            all_video.append(current_video)
+            # Final output video
+            video = 255.0 * torch.cat(all_video, dim=1)
+            # Clear VAE cache
+            pipeline.vae.model.clear_cache()
+        else:
+            latents = generated
 
     if dist.is_initialized():
         rank = dist.get_rank()
@@ -675,13 +714,14 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             else:
                 base_name = f'rank{rank}-{prompt[:100]}-{seed_idx}_{model_type}'
 
-            if save_latents_only:
-                latent_path = os.path.join(config.output_folder, f'{base_name}.pt')
-                torch.save(latents[seed_idx].cpu(), latent_path)
-            else:
-                output_path = os.path.join(config.output_folder, f'{base_name}.mp4')
-                fps = 24 if '5B' in config.model_kwargs.model_name else 16
-                write_video(output_path, video[seed_idx], fps=fps)
+            with _e2e_stage(_stage, "write_s"):
+                if save_latents_only:
+                    latent_path = os.path.join(config.output_folder, f'{base_name}.pt')
+                    torch.save(latents[seed_idx].cpu(), latent_path)
+                else:
+                    output_path = os.path.join(config.output_folder, f'{base_name}.mp4')
+                    fps = 24 if '5B' in config.model_kwargs.model_name else 16
+                    write_video(output_path, video[seed_idx], fps=fps)
 
             prompt_txt_path = os.path.join(config.output_folder, f'{base_name}_prompts.txt')
             save_prompts_to_txt(
@@ -690,5 +730,59 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
                 is_main_process=(rank == 0),
             )
 
+    if _LLV2_E2E:
+        _stage["idx"] = idx
+        _stage["total_s"] = sum(
+            _stage.get(k, 0.0) for k in ("generate_s", "postproc_s", "write_s")
+        )
+        _e2e_videos.append(_stage)
+        print(
+            f"[LLV2_E2E] video idx={idx} "
+            + " ".join(
+                f"{k}={_stage.get(k, 0.0):.2f}"
+                for k in (
+                    "text_encode_s", "dit_s", "vae_decode_s",
+                    "generate_s", "postproc_s", "write_s", "total_s",
+                )
+            ),
+            flush=True,
+        )
+
     if config.inference_iter != -1 and i >= config.inference_iter:
         break
+
+if _LLV2_E2E and _e2e_videos:
+    _n = len(_e2e_videos)
+    _tot = sorted(v["total_s"] for v in _e2e_videos)
+    _mean = {
+        k: sum(v.get(k, 0.0) for v in _e2e_videos) / _n
+        for k in (
+            "text_encode_s", "dit_s", "vae_decode_s",
+            "generate_s", "postproc_s", "write_s", "total_s",
+        )
+    }
+    _sec_of_video = getattr(config, "num_output_frames", 0) * 4 / 24.0
+    print(
+        f"[LLV2_E2E_SUMMARY] videos={_n} setup_s={_e2e_setup_s:.2f} "
+        f"mean_total_s={_mean['total_s']:.2f} "
+        f"median_total_s={_tot[_n // 2]:.2f} "
+        f"mean_text_encode_s={_mean['text_encode_s']:.2f} "
+        f"mean_dit_s={_mean['dit_s']:.2f} "
+        f"mean_vae_decode_s={_mean['vae_decode_s']:.2f} "
+        f"mean_generate_s={_mean['generate_s']:.2f} "
+        f"mean_postproc_s={_mean['postproc_s']:.2f} "
+        f"mean_write_s={_mean['write_s']:.2f} "
+        f"video_seconds={_sec_of_video:.1f} "
+        f"realtime_factor={(_sec_of_video / _mean['total_s'] if _mean['total_s'] else 0):.2f}x",
+        flush=True,
+    )
+    _e2e_path = os.environ.get("LLV2_E2E_JSON")
+    if _e2e_path:
+        os.makedirs(os.path.dirname(_e2e_path) or ".", exist_ok=True)
+        with open(_e2e_path, "w") as _fh:
+            json.dump(
+                {"setup_s": _e2e_setup_s, "mean": _mean, "videos": _e2e_videos},
+                _fh,
+                indent=2,
+            )
+        print(f"[LLV2_E2E] wrote {_e2e_path}", flush=True)

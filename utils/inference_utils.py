@@ -230,6 +230,7 @@ def setup_nvfp4_pipeline(
                 verbose=verbose,
             )
 
+        pipeline.to(dtype=torch.bfloat16)
         if use_te:
             pipeline.generator.model, _ = quantize_model_for_transformer_engine_nvfp4(
                 pipeline.generator.model,
@@ -251,7 +252,6 @@ def setup_nvfp4_pipeline(
             )
             from utils.quant import _materialize_quantized_weights_for_inference as materialize_fn
 
-        pipeline.to(dtype=torch.bfloat16)
         materialize_fn(pipeline.generator.model, target_device=device)
 
     pipeline.generator.to(device=device)

@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -79,6 +80,10 @@ def rope_apply(x, grid_sizes, freqs, t_scale=1.0, method="linear", original_seq_
     return torch.stack(output).type_as(x)
 
 
+# Bit-exact fused RMSNorm (utils/rmsnorm_triton.py). LLV2_TRITON_RMSNORM=0 disables.
+_TRITON_RMSNORM_ENABLED = os.environ.get("LLV2_TRITON_RMSNORM", "1") == "1"
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -92,6 +97,15 @@ class WanRMSNorm(nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
+        if (
+            _TRITON_RMSNORM_ENABLED
+            and not torch.is_grad_enabled()
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+        ):
+            from utils.rmsnorm_triton import rmsnorm_bitexact
+            return rmsnorm_bitexact(x, self.weight, self.eps)
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):

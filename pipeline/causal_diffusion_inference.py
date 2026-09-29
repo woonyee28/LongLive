@@ -825,10 +825,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 f"multiple of BitDecoding-FP4's fixed PAGE_SIZE ({PAGE_SIZE})"
             )
             pages_per_block = block_token_size // PAGE_SIZE
-            for _ in range(self.num_transformer_blocks):
+            for layer_idx in range(self.num_transformer_blocks):
                 for cache_list in (kv_cache_pos, kv_cache_neg):
                     cache_list.append({
                         "fp4_cache": init_fp4_kv_cache(max_blocks, pages_per_block, num_heads, device),
+                        # which layer's K shift (LLV2_KEY_SHIFT) this cache's keys get
+                        "layer_index": layer_idx,
                         "quantized": False,
                         "fp4_attn": True,
                         "block_token_size": block_token_size,

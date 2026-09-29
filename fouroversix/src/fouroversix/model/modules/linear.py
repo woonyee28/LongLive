@@ -2,6 +2,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from fouroversix.matmul import fp4_matmul
+from fouroversix.model.modules.bias_add import bias_add_, can_fuse_bias_add
 from fouroversix.model.config import ModuleQuantizationConfig
 from fouroversix.model.quantize import QuantizedModule
 from fouroversix.quantize import (
@@ -79,7 +80,10 @@ class FourOverSixLinearFunction(torch.autograd.Function):
             out_dtype=config.output_dtype,
         ).reshape(*input.shape[:-1], weight_q.original_shape[0])
         if bias is not None:
-            out = out + bias
+            if can_fuse_bias_add(out, bias):
+                out = bias_add_(out, bias)
+            else:
+                out = out + bias
         return out
 
     @staticmethod

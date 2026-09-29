@@ -76,6 +76,39 @@ _CGRAPH_OUTPLACE_KV_ENABLED = os.environ.get("LLV2_CGRAPH_OUTPLACE_KV", "0") == 
 # Set LLV2_TRITON_ADALN=0 to fall back to eager nn.LayerNorm + Python modulate.
 _TRITON_ADALN_ENABLED = os.environ.get("LLV2_TRITON_ADALN", "1") == "1"
 
+# Quantize the shared Q/K/V input once (bit-identical). LLV2_SHARED_QKV_QUANT=0 disables.
+_SHARED_QKV_QUANT_ENABLED = os.environ.get("LLV2_SHARED_QKV_QUANT", "1") == "1"
+
+
+def _shared_input_linears(linears, x):
+    """Apply linears to the same `x`, quantizing it once when they share a FourOverSix activation config."""
+    first = linears[0]
+    if (
+        _SHARED_QKV_QUANT_ENABLED
+        and not torch.is_grad_enabled()
+        and all(hasattr(l, "forward_with_precomputed_activation") for l in linears)
+        and len({l.activation_quantization_key() for l in linears}) == 1
+        # the precomputed path has no int32 chunking
+        and x.numel() <= first._INT32_MAX
+    ):
+        x_q = first.quantize_activation(x)
+        return tuple(l.forward_with_precomputed_activation(x, x_q) for l in linears)
+    return tuple(l(x) for l in linears)
+
+
+# Bit-exact fused `x + y * gate`. LLV2_TRITON_GATED_RESIDUAL=0 disables.
+_TRITON_GATED_RESIDUAL_ENABLED = os.environ.get("LLV2_TRITON_GATED_RESIDUAL", "1") == "1"
+
+
+def _gated_residual(x, y, gate, num_frames, frame_seqlen):
+    """x + (y.unflatten(1, (num_frames, frame_seqlen)) * gate).flatten(1, 2)"""
+    if _TRITON_GATED_RESIDUAL_ENABLED:
+        from utils.residual_triton import can_fuse_gated_residual, gated_residual
+        if can_fuse_gated_residual(x, y, gate):
+            return gated_residual(x, y, gate, frame_seqlen)
+    return x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate).flatten(1, 2)
+
+
 # iter-31: per-chunk Python-int metadata published by CausalWanModel.forward
 # so attention forwards can read Python ints without `.item()` graph breaks.
 # Single-thread inference assumption — overwritten before each model() call.
@@ -363,9 +396,10 @@ class CausalWanSelfAttention(nn.Module):
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            q_out, k_out, v_out = _shared_input_linears((self.q, self.k, self.v), x)
+            q = self.norm_q(q_out).view(b, s, n, d)
+            k = self.norm_k(k_out).view(b, s, n, d)
+            v = v_out.view(b, s, n, d)
             return q, k, v
 
         q, k, v = qkv_fn(x)
@@ -559,8 +593,7 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
 
                 if is_fp4_cache:
-                    from utils.quant import k_smooth
-                    from utils.fp4_attention import roll_blocks, insert_block
+                    from utils.fp4_attention import roll_blocks, insert_block, transform_key_for_cache
 
                     assert not has_pinned, "fp4_attn does not support multi-shot pinned regions yet"
                     blk_sz = int(kv_cache["block_token_size"])
@@ -575,10 +608,11 @@ class CausalWanSelfAttention(nn.Module):
                     _fp4dbg.on_roll(kv_cache, effective_sink, num_evicted_tokens, num_rolled_tokens)
                     start_blk = local_start_index // blk_sz
                     n_insert_blks = (local_end_index - local_start_index) // blk_sz
-                    _k_sm = k_smooth(key_to_cache).squeeze(0)
+                    # k_smooth, K centering (LLV2_KEY_SHIFT) and LLV2_ROTATION
+                    _k_sm = transform_key_for_cache(kv_cache["layer_index"], key_to_cache.squeeze(0))
                     insert_block(
                         kv_cache["fp4_cache"], start_blk, n_insert_blks,
-                        _k_sm, v.squeeze(0),
+                        _k_sm, v.squeeze(0), layer=kv_cache["layer_index"],
                     )
                     _fp4dbg.on_insert(kv_cache, local_start_index, local_end_index, _k_sm, v.squeeze(0))
                     cache_update_info = None
@@ -651,8 +685,7 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
 
                 if is_fp4_cache:
-                    from utils.quant import k_smooth
-                    from utils.fp4_attention import insert_block
+                    from utils.fp4_attention import insert_block, transform_key_for_cache
 
                     blk_sz = int(kv_cache["block_token_size"])
                     assert local_start_index % blk_sz == 0 and (local_end_index - local_start_index) % blk_sz == 0, (
@@ -660,10 +693,11 @@ class CausalWanSelfAttention(nn.Module):
                     )
                     start_blk = local_start_index // blk_sz
                     n_insert_blks = (local_end_index - local_start_index) // blk_sz
-                    _k_sm = k_smooth(key_to_cache).squeeze(0)
+                    # k_smooth, K centering (LLV2_KEY_SHIFT) and LLV2_ROTATION
+                    _k_sm = transform_key_for_cache(kv_cache["layer_index"], key_to_cache.squeeze(0))
                     insert_block(
                         kv_cache["fp4_cache"], start_blk, n_insert_blks,
-                        _k_sm, v.squeeze(0),
+                        _k_sm, v.squeeze(0), layer=kv_cache["layer_index"],
                     )
                     from utils import fp4_attention_debug as _fp4dbg
                     _fp4dbg.on_insert(kv_cache, local_start_index, local_end_index, _k_sm, v.squeeze(0))
@@ -725,12 +759,14 @@ class CausalWanSelfAttention(nn.Module):
                     "window beyond the ring buffer's own capacity"
                 )
                 assert not use_relative_rope, "fp4_attn does not support use_relative_rope (K is quantized once, at insertion)"
-                from utils.fp4_attention import attend
+                from utils.fp4_attention import attend, transform_query_for_attend
 
                 seqused_fp4 = kv_cache["local_end_index"].to(torch.int32)
                 from utils import fp4_attention_debug as _fp4dbg
                 x = _fp4dbg.attend_or_ref(
-                    kv_cache, roped_query, seqused_fp4, self.head_dim ** -0.5, self.num_heads, attend,
+                    # Q in the cached K's basis (LLV2_ROTATION)
+                    kv_cache, transform_query_for_attend(kv_cache["layer_index"], roped_query, self.num_heads),
+                    seqused_fp4, self.head_dim ** -0.5, self.num_heads, attend,
                     past_tokens=local_start_index, total_tokens=local_end_index,
                     sink_tokens=sink_tokens,
                 )
@@ -950,7 +986,7 @@ class CausalWanAttentionBlock(nn.Module):
         else:
             y = self_attn_result
             cache_update_info = None
-        x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
+        x = _gated_residual(x, y, e[2], num_frames, frame_seqlen)
 
         # cross-attention & ffn function
         # iter-40: avoid `seq_lens[0].item()` graph break. seq_lens[0] equals
@@ -980,8 +1016,7 @@ class CausalWanAttentionBlock(nn.Module):
                 ffn_in = (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                           frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
             y = self.ffn(ffn_in)
-            x = x + (y.unflatten(dim=1, sizes=(num_frames,
-                     frame_seqlen)) * e[5]).flatten(1, 2)
+            x = _gated_residual(x, y, e[5], num_frames, frame_seqlen)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
